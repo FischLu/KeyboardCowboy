@@ -1,7 +1,11 @@
+import Carbon
 import Cocoa
+import MachPort
 import Windows
 
 final class SystemHideAllAppsRunner {
+  @MainActor static var machPort: MachPortEventController?
+
   static func run(workflowCommands: [Command]) async throws {
     guard let screen = NSScreen.main else { return }
 
@@ -11,13 +15,12 @@ final class SystemHideAllAppsRunner {
     }
 
     let windows = Set(indexWindowsInStage(getWindows(), targetRect: screen.visibleFrame)
-      .map(\.ownerName))
+      .map(\.ownerPid.rawValue))
 
-    let apps = NSWorkspace.shared.runningApplications
+    var apps = NSWorkspace.shared.runningApplications
       .filter {
-        guard let localizedName = $0.localizedName else { return false }
-
-        guard windows.contains(localizedName) else { return false }
+        let processIdentifier = Int($0.processIdentifier)
+        guard windows.contains(processIdentifier) else { return false }
 
         guard !exceptBundleIdentifiers.contains($0.bundleIdentifier ?? "") else { return false }
         guard let bundleURL = $0.bundleURL else { return false }
@@ -32,14 +35,28 @@ final class SystemHideAllAppsRunner {
       }
       .filter { $0.activationPolicy == .regular && $0.isHidden == false }
 
+    // Fix Podcasts app not hiding when calling `NSRunningApplication.hide()`
+    let misbehavingBundles = Set(arrayLiteral: "com.apple.podcasts")
+    for app in apps where misbehavingBundles.contains(app.bundleIdentifier ?? "") {
+      if #available(macOS 14.0, *) {
+        app.activate(from: NSWorkspace.shared.frontmostApplication!, options: .activateAllWindows)
+      } else {
+        app.activate(options: .activateAllWindows)
+      }
+      _ = try? await machPort?.post(kVK_ANSI_H, type: .keyDown, flags: .maskCommand)
+      _ = try? await machPort?.post(kVK_ANSI_H, type: .keyUp, flags: .maskCommand)
+
+      apps.removeAll(where: { $0.bundleIdentifier == app.bundleIdentifier })
+    }
+
     var processIdentifiers = Set<Int>()
     for app in apps {
       app.hide()
       processIdentifiers.insert(Int(app.processIdentifier))
     }
-
     var timeout: Int = 0
     var waitingForWindowsToDisappear: Bool = true
+
     while waitingForWindowsToDisappear {
       if timeout >= 10 {
         waitingForWindowsToDisappear = false
